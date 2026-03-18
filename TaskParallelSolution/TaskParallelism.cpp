@@ -1,75 +1,93 @@
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <chrono>
-#include <climits>
-#include <fstream>
 #include <iostream>
-#include <set>
-#include <string>
+#include <fstream>
 #include <vector>
-#include <omp.h>
-
+#include <string>
+#include <array>
+#include <set>
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <chrono>
+#include <omp.h> 
 using namespace std;
 
 // ===================== DATA STRUCTURES =====================
-
+// One placed piece on the board
 struct Placement {
-    char type;         // 'T' or 'Z'
-    int id;            // piece id used for label (T1, Z2, ...)
-    vector<int> cells; // covered cells
+    char type;              // 'T' or 'Z'
+    int id;                 // number used in output, for example T1
+    vector<int> cells;      // the 4 cells covered by this piece
 };
 
+// A shape is stored as 4 relative coordinates
 using Offset = pair<int, int>;
 using Shape = array<Offset, 4>;
 
-struct SearchNode {
+// ===================== GLOBAL VARIABLES =====================
+// Board size
+int rows, cols, totalCells;
+
+// Shared best solution found so far
+long bestCost = INT_MAX;
+vector<string> bestOutput;
+
+// Total DFS calls across all tasks
+long long dfsCalls = 0;
+
+// Input values
+vector<int> values;         // value of each cell
+
+// All unique rotations/reflections of T and Z
+vector<Shape> tShapes;
+vector<Shape> zShapes;
+
+// Limit for task creation depth
+const int TASK_DEPTH_LIMIT = 2;
+
+// State of one DFS branch - each task gets its own copy
+struct SearchState {
     long currentCost = 0;
     int countT = 0;
     int countZ = 0;
     int nextTId = 1;
     int nextZId = 1;
-    int remainingUndecided = 0;
-    vector<int> state;     // 0 = undecided, -1 = uncovered, 1 = covered
-    vector<string> labels; // piece labels for covered cells
+    vector<int> state;          // 0 = undecided, -1 = uncovered, 1 = covered
+    vector<string> labels;      // current labels written in covered cells
 };
-
-// ===================== GLOBAL READ-ONLY PROBLEM DATA =====================
-
-int rows = 0;
-int cols = 0;
-int totalCells = 0;
-vector<int> values;
-vector<Shape> tShapes;
-vector<Shape> zShapes;
 
 // ===================== BASIC BOARD HELPERS =====================
 
+// Convert (row,col) to linear index
 int cellIndex(int r, int c) {
     return r * cols + c;
 }
 
+// Check if coordinate lies inside board
 bool insideBoard(int r, int c) {
     return 0 <= r && r < rows && 0 <= c && c < cols;
 }
 
 // ===================== SHAPE MANIPULATION =====================
 
+// Move shape so its top-left used cell becomes (0,0)
 Shape normalizeShape(Shape shape) {
-    int minRow = INT_MAX;
-    int minCol = INT_MAX;
-    for (const auto& cell : shape) {
+    int minRow = INT_MAX, minCol = INT_MAX;
+
+    for (auto cell : shape) {
         minRow = min(minRow, cell.first);
         minCol = min(minCol, cell.second);
     }
+
     for (auto& cell : shape) {
         cell.first -= minRow;
         cell.second -= minCol;
     }
+
     sort(shape.begin(), shape.end());
     return shape;
 }
 
+// Rotate shape 90 degrees
 Shape rotate90(Shape shape) {
     for (auto& cell : shape) {
         cell = {cell.second, -cell.first};
@@ -77,6 +95,7 @@ Shape rotate90(Shape shape) {
     return shape;
 }
 
+// Mirror shape horizontally
 Shape reflectShape(Shape shape) {
     for (auto& cell : shape) {
         cell = {cell.first, -cell.second};
@@ -84,217 +103,254 @@ Shape reflectShape(Shape shape) {
     return shape;
 }
 
+// Build all unique rotations and mirror versions of one base shape
 vector<Shape> buildAllOrientations(Shape baseShape) {
     set<vector<Offset>> seen;
     vector<Shape> result;
+
     for (int mirror = 0; mirror < 2; mirror++) {
-        Shape currentShape = (mirror == 0 ? baseShape : reflectShape(baseShape));
+        Shape currentShape;
+        if (mirror == 0) currentShape = baseShape;
+        else currentShape = reflectShape(baseShape);
+
         for (int rotation = 0; rotation < 4; rotation++) {
             Shape normalized = normalizeShape(currentShape);
             vector<Offset> key(normalized.begin(), normalized.end());
+
             if (seen.insert(key).second) {
                 result.push_back(normalized);
             }
+
             currentShape = rotate90(currentShape);
         }
     }
+
     return result;
 }
 
 // ===================== SEARCH UTILITIES =====================
 
-int findFirstUndecidedCell(const SearchNode& node) {
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Find the first cell that has not been decided yet
+int findFirstUndecidedCell(const SearchState& s) {
     for (int i = 0; i < totalCells; i++) {
-        if (node.state[i] == 0) return i;
+        if (s.state[i] == 0) return i;
     }
     return -1;
 }
 
-bool canStillFixTZDifference(int countT, int countZ, int remainingUndecided) {
-    int difference = countT - countZ;
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Check if it is still possible to finish with |T - Z| <= 1
+bool canStillFixTZDifference(const SearchState& s, int remainingUndecided) {
+    int difference = s.countT - s.countZ;
     int maxMorePieces = remainingUndecided / 4;
-    int minDiff = -maxMorePieces - 1;
-    int maxDiff = maxMorePieces + 1;
-    return difference >= minDiff && difference <= maxDiff;
-}
 
-void saveBoard(const SearchNode& node, vector<string>& output) {
-    output.resize(totalCells);
-    for (int i = 0; i < totalCells; i++) {
-        output[i] = (node.state[i] == -1 ? to_string(values[i]) : node.labels[i]);
-    }
+    int minDiff = -maxMorePieces - 1;
+    int maxDiff =  maxMorePieces + 1;
+
+    return difference >= minDiff && difference <= maxDiff;
 }
 
 // ===================== PLACEMENT GENERATION =====================
 
-void generatePlacementsAtCell(const SearchNode& node,
-                              int pivot,
-                              char pieceType,
-                              const vector<Shape>& shapes,
-                              vector<Placement>& out) {
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Generate all ways to place a piece so that it covers the chosen cell
+void generatePlacementsAtCell(const SearchState& s, int pivot, char pieceType, const vector<Shape>& shapes, vector<Placement>& out) {
+
     int row = pivot / cols;
     int col = pivot % cols;
 
+    // Try every orientation of the piece
     for (const auto& shape : shapes) {
+
+        // Try every block of the shape as the pivot anchor
         for (int anchor = 0; anchor < 4; anchor++) {
+
             int startRow = row - shape[anchor].first;
             int startCol = col - shape[anchor].second;
+
             vector<int> coveredCells;
-            coveredCells.reserve(4);
             bool ok = true;
 
+            // Check all 4 blocks of the piece
             for (int i = 0; i < 4; i++) {
+
                 int r = startRow + shape[i].first;
                 int c = startCol + shape[i].second;
-                int idx = cellIndex(r, c);
-                if (!insideBoard(r, c) || node.state[idx] != 0) {
+
+                // Placement must stay inside the board and on undecided cells
+                if (!insideBoard(r, c) || s.state[cellIndex(r, c)] != 0) {
                     ok = false;
                     break;
                 }
-                coveredCells.push_back(idx);
+
+                coveredCells.push_back(cellIndex(r, c));
             }
 
-            if (ok) out.push_back({pieceType, -1, coveredCells});
+            // If placement was valid, store it
+            if (ok) {
+                out.push_back({pieceType, -1, coveredCells});
+            }
         }
     }
 }
 
-// ===================== STATE OPERATIONS =====================
+// ===================== BOARD STATE OPERATIONS =====================
 
-void placePiece(SearchNode& node, Placement& placement) {
-    placement.id = (placement.type == 'T' ? node.nextTId++ : node.nextZId++);
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Save the current board as the best answer
+void saveBestBoard(const SearchState& s) {
+    vector<string> candidate(totalCells);
+
+    for (int i = 0; i < totalCells; i++) {
+        if (s.state[i] == -1) candidate[i] = to_string(values[i]);
+        else candidate[i] = s.labels[i];
+    }
+
+    #pragma omp critical(best_solution_update) // CHANGED FOR TASK PARALLELISM
+    {
+        if (s.currentCost < bestCost) {
+            bestCost = s.currentCost;
+            bestOutput = move(candidate);
+        }
+    }
+}
+
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Place a tetromino on the board
+void placePiece(SearchState& s, Placement& placement) {
+    placement.id = (placement.type == 'T' ? s.nextTId++ : s.nextZId++);
     string pieceLabel(1, placement.type);
     pieceLabel += to_string(placement.id);
 
     for (int cell : placement.cells) {
-        node.state[cell] = 1;
-        node.labels[cell] = pieceLabel;
+        s.state[cell] = 1;
+        s.labels[cell] = pieceLabel;
     }
-    if (placement.type == 'T') node.countT++;
-    else node.countZ++;
-    node.remainingUndecided -= 4;
+
+    if (placement.type == 'T') s.countT++;
+    else s.countZ++;
 }
 
-void removePiece(SearchNode& node, const Placement& placement) {
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Undo placing one piece
+void removePiece(SearchState& s, const Placement& placement) {
     for (int cell : placement.cells) {
-        node.state[cell] = 0;
-        node.labels[cell].clear();
+        s.state[cell] = 0;
+        s.labels[cell].clear();
     }
+
     if (placement.type == 'T') {
-        node.countT--;
-        node.nextTId--;
+        s.countT--;
+        s.nextTId--;
     } else {
-        node.countZ--;
-        node.nextZId--;
+        s.countZ--;
+        s.nextZId--;
     }
-    node.remainingUndecided += 4;
 }
 
-void markUncovered(SearchNode& node, int cell) {
-    node.state[cell] = -1;
-    node.currentCost += values[cell];
-    node.remainingUndecided--;
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Mark a cell uncovered
+void markUncovered(SearchState& s, int cell) {
+    s.state[cell] = -1;
+    s.currentCost += values[cell];
 }
 
-void undoMarkUncovered(SearchNode& node, int cell) {
-    node.state[cell] = 0;
-    node.currentCost -= values[cell];
-    node.remainingUndecided++;
+// CHANGED FOR TASK PARALLELISM (added variable into the function)
+// Undo uncovered decision
+void undoMarkUncovered(SearchState& s, int cell) {
+    s.state[cell] = 0;
+    s.currentCost -= values[cell];
 }
 
-// ===================== DFS USED INSIDE TASKS =====================
+// ===================== MAIN DFS SEARCH =====================
 
-void dfsFromFrontier(SearchNode& node,
-                     long& localBestCost,
-                     vector<string>& localBestOutput,
-                     const atomic<long>& sharedBestCost,
-                     long long& localDfsCalls) {
-    localDfsCalls++;
+// CHANGED FOR TASK PARALLELISM
+// Main recursive search
+void dfs(SearchState& s, int depth = 0) {
+    #pragma omp atomic
+    dfsCalls++;
 
-    long sharedBound = sharedBestCost.load(memory_order_relaxed);
-    long pruneBound = min(localBestCost, sharedBound);
-    if (node.currentCost >= pruneBound) return;
+    // Stop if this branch is already worse than the best answer
+    long snapshotBest;
+    #pragma omp atomic read
+    snapshotBest = bestCost;
 
-    int firstCell = findFirstUndecidedCell(node);
+    if (s.currentCost >= snapshotBest) return;
+
+    int firstCell = findFirstUndecidedCell(s);
+
+    // If there is no undecided cell left, we have a complete solution
     if (firstCell == -1) {
-        if (abs(node.countT - node.countZ) <= 1 && node.currentCost < localBestCost) {
-            localBestCost = node.currentCost;
-            saveBoard(node, localBestOutput);
+        if (abs(s.countT - s.countZ) <= 1) {
+            long currentBest;
+            #pragma omp atomic read
+            currentBest = bestCost;
+
+            if (s.currentCost < currentBest) {
+                saveBestBoard(s);
+            }
         }
         return;
     }
 
-    if (!canStillFixTZDifference(node.countT, node.countZ, node.remainingUndecided)) return;
-
-    vector<Placement> placements;
-    placements.reserve(64);
-    generatePlacementsAtCell(node, firstCell, 'T', tShapes, placements);
-    generatePlacementsAtCell(node, firstCell, 'Z', zShapes, placements);
-
-    for (auto& placement : placements) {
-        placePiece(node, placement);
-        if (canStillFixTZDifference(node.countT, node.countZ, node.remainingUndecided)) {
-            dfsFromFrontier(node, localBestCost, localBestOutput, sharedBestCost, localDfsCalls);
-        }
-        removePiece(node, placement);
+    // Count how many cells are still undecided
+    int remainingUndecided = 0;
+    for (int x : s.state) {
+        if (x == 0) remainingUndecided++;
     }
 
-    markUncovered(node, firstCell);
-    dfsFromFrontier(node, localBestCost, localBestOutput, sharedBestCost, localDfsCalls);
-    undoMarkUncovered(node, firstCell);
-}
+    // If the T/Z balance can no longer be fixed, stop
+    if (!canStillFixTZDifference(s, remainingUndecided)) return;
 
-// ===================== SHORT BFS SPLIT PHASE =====================
+    // Build all candidate placements that cover the chosen cell
+    vector<Placement> placements;
+    placements.reserve(64);
+    generatePlacementsAtCell(s, firstCell, 'T', tShapes, placements);
+    generatePlacementsAtCell(s, firstCell, 'Z', zShapes, placements);
 
-void buildFrontierWithShortBfs(vector<SearchNode>& frontier,
-                               int maxBfsDepth,
-                               int targetTaskCount,
-                               atomic<long>& bestCost,
-                               vector<string>& bestOutput,
-                               long long& bfsCalls) {
-    for (int depth = 0; depth < maxBfsDepth; depth++) {
-        vector<SearchNode> next;
-        next.reserve(frontier.size() * 8);
-
-        for (const SearchNode& node : frontier) {
-            bfsCalls++;
-
-            if (node.currentCost >= bestCost.load(memory_order_relaxed)) continue;
-
-            int firstCell = findFirstUndecidedCell(node);
-            if (firstCell == -1) {
-                if (abs(node.countT - node.countZ) <= 1 &&
-                    node.currentCost < bestCost.load(memory_order_relaxed)) {
-                    bestCost.store(node.currentCost, memory_order_relaxed);
-                    saveBoard(node, bestOutput);
-                }
-                continue;
-            }
-
-            if (!canStillFixTZDifference(node.countT, node.countZ, node.remainingUndecided)) continue;
-
-            vector<Placement> placements;
-            placements.reserve(64);
-            generatePlacementsAtCell(node, firstCell, 'T', tShapes, placements);
-            generatePlacementsAtCell(node, firstCell, 'Z', zShapes, placements);
-
-            for (const Placement& basePlacement : placements) {
-                SearchNode child = node;
-                Placement placement = basePlacement;
+    // CHANGED FOR TASK PARALLELISM
+    // In upper levels create OpenMP tasks, deeper in the tree continue sequentially
+    if (depth < TASK_DEPTH_LIMIT) {
+        #pragma omp taskgroup // wait for child tasks
+        {
+            // Try placing a tetromino
+            for (auto placement : placements) {
+                SearchState child = s;
                 placePiece(child, placement);
-                if (canStillFixTZDifference(child.countT, child.countZ, child.remainingUndecided)) {
-                    next.push_back(std::move(child));
+
+                if (canStillFixTZDifference(child, remainingUndecided - 4)) {
+                    #pragma omp task firstprivate(child, depth) // spawn child task
+                    {
+                        dfs(child, depth + 1);
+                    }
                 }
             }
 
-            SearchNode uncovered = node;
-            markUncovered(uncovered, firstCell);
-            next.push_back(std::move(uncovered));
+            // Try leaving the chosen cell uncovered
+            SearchState child = s;
+            markUncovered(child, firstCell);
+
+            #pragma omp task firstprivate(child, depth) // spawn child task
+            {
+                dfs(child, depth + 1);
+            }
+        }
+    } else {
+        // Original sequential recursion
+        for (auto& placement : placements) {
+            placePiece(s, placement);
+
+            if (canStillFixTZDifference(s, remainingUndecided - 4)) {
+                dfs(s, depth + 1);
+            }
+
+            removePiece(s, placement);
         }
 
-        if (next.empty()) break;
-        frontier.swap(next);
-        if (static_cast<int>(frontier.size()) >= targetTaskCount) break;
+        markUncovered(s, firstCell);
+        dfs(s, depth + 1);
+        undoMarkUncovered(s, firstCell);
     }
 }
 
@@ -302,13 +358,16 @@ void buildFrontierWithShortBfs(vector<SearchNode>& frontier,
 
 bool readInput(istream& in) {
     if (!(in >> rows >> cols)) return false;
+
     totalCells = rows * cols;
     values.assign(totalCells, 0);
+
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
             in >> values[cellIndex(r, c)];
         }
     }
+
     return true;
 }
 
@@ -320,6 +379,7 @@ int main(int argc, char** argv) {
 
     istream* input = &cin;
     ifstream file;
+
     if (argc > 1) {
         file.open(argv[1]);
         if (!file) {
@@ -334,69 +394,33 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    tShapes = buildAllOrientations({Offset{0, 0}, Offset{0, 1}, Offset{0, 2}, Offset{1, 1}});
-    zShapes = buildAllOrientations({Offset{0, 0}, Offset{0, 1}, Offset{1, 1}, Offset{1, 2}});
+    // Build all rotations and mirror versions of T and Z
+    tShapes = buildAllOrientations({Offset{0,0}, Offset{0,1}, Offset{0,2}, Offset{1,1}});
+    zShapes = buildAllOrientations({Offset{0,0}, Offset{0,1}, Offset{1,1}, Offset{1,2}});
 
-    SearchNode root;
-    root.remainingUndecided = totalCells;
+    // CHANGED FOR TASK PARALLELISM
+    // Create initial search state
+    SearchState root;
     root.state.assign(totalCells, 0);
     root.labels.assign(totalCells, "");
 
-    atomic<long> bestCost(LONG_MAX);
-    vector<string> bestOutput;
-    long long dfsCalls = 0;
-
+    // Timing
     auto startTime = chrono::high_resolution_clock::now();
 
-    vector<SearchNode> frontier = {root};
-    const int maxThreads = omp_get_max_threads();
-    const int bfsDepth = 3;                  // short BFS
-    const int targetTaskCount = maxThreads * 8;
-    long long bfsCalls = 0;
-
-    buildFrontierWithShortBfs(frontier, bfsDepth, targetTaskCount, bestCost, bestOutput, bfsCalls);
-    dfsCalls += bfsCalls;
-
-    if (!frontier.empty()) {
-        #pragma omp parallel
+    // CHANGED FOR TASK PARALLELISM
+    // Run DFS in OpenMP task parallel region
+    #pragma omp parallel
+    {
+        #pragma omp single
         {
-            #pragma omp single nowait
-            {
-                for (size_t i = 0; i < frontier.size(); i++) {
-                    SearchNode startNode = frontier[i];
-                    #pragma omp task firstprivate(startNode)
-                    {
-                        long localBestCost = bestCost.load(memory_order_relaxed);
-                        vector<string> localBestOutput;
-                        long long localDfsCalls = 0;
-
-                        dfsFromFrontier(startNode,
-                                        localBestCost,
-                                        localBestOutput,
-                                        bestCost,
-                                        localDfsCalls);
-
-                        #pragma omp atomic
-                        dfsCalls += localDfsCalls;
-
-                        if (!localBestOutput.empty()) {
-                            #pragma omp critical(best_update)
-                            {
-                                if (localBestCost < bestCost.load(memory_order_relaxed)) {
-                                    bestCost.store(localBestCost, memory_order_relaxed);
-                                    bestOutput = localBestOutput;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            dfs(root, 0);
         }
     }
 
     auto endTime = chrono::high_resolution_clock::now();
     auto elapsed = chrono::duration_cast<chrono::milliseconds>(endTime - startTime);
 
+    // Print the best board found
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
             if (c) cout << ' ';
@@ -405,7 +429,7 @@ int main(int argc, char** argv) {
         cout << "\n";
     }
 
-    cout << "\nMIN_COST " << bestCost.load(memory_order_relaxed) << "\n";
+    cout << "\nMIN_COST " << bestCost << "\n";
     cout << "DFS_CALLS " << dfsCalls << "\n";
     cout << "TIME_MS " << elapsed.count() << "\n";
     return 0;

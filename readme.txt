@@ -37,23 +37,7 @@ Performance:
 - Computes minimum uncovered cost and DFS call count.
 - Evaluates speedup and scalability across multiple cores or processes.
 
-Build & Run:
-
-Sequential:
-g++ -O2 -std=c++17 solver.cpp -o solver
-./solver < mapa/mapa5_11.txt
-
-OpenMP:
-g++ -O2 -std=c++17 -fopenmp solver.cpp -o solver
-./solver < mapa/mapa5_11.txt
-
-MPI:
-mpic++ -O2 solver.cpp -o solver
-mpirun -np 4 ./solver < mapa/mapa5_11.txt
-
-Output: board covering, minimum uncovered cost, number of DFS calls.
-
 
 Author:
 
-Vojtěch Naar – ČVUT NI-PDP course project
+Vojtech Naar – CVUT NI-PDP course project

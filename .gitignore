@@ -1,3 +1,8 @@
-.DS_store
+.DS_Store
 *.out
-/.vscode
+*.o
+*.obj
+.vscode/
+.idea/
+build/
+bin/

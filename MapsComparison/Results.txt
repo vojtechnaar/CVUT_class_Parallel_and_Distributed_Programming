@@ -1,0 +1,19 @@
+Map: maps/mapa3_5.txt
+  Sequential  time=0      ms  minCost=25  dfsCalls=406
+  Task      time=2      ms  minCost=25  dfsCalls=419
+  Data      time=1      ms  minCost=25  dfsCalls=259
+
+Map: maps/mapa5_11.txt
+  Sequential  time=1479   ms  minCost=18  dfsCalls=6004416  speedup=1.00x
+  Task      time=757    ms  minCost=18  dfsCalls=5937296  speedup=1.95x
+  Data      time=861    ms  minCost=18  dfsCalls=7546276  speedup=1.72x
+
+Map: maps/mapa7_7.txt
+  Sequential  time=12     ms  minCost=10  dfsCalls=43174  speedup=1.00x
+  Task      time=33     ms  minCost=10  dfsCalls=248391  speedup=0.36x
+  Data      time=9      ms  minCost=10  dfsCalls=58176  speedup=1.33x
+
+Map: maps/mapa7_10.txt
+  Sequential  time=3460   ms  minCost=5  dfsCalls=14278563  speedup=1.00x
+  Task      time=1809   ms  minCost=5  dfsCalls=13136432  speedup=1.91x
+  Data      time=1565   ms  minCost=5  dfsCalls=13835428  speedup=2.21x

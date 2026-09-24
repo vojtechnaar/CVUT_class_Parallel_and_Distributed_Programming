@@ -1,8 +1,8 @@
 # Parallel Tetromino Solver
 
-A comparison of sequential and OpenMP-based parallel strategies for solving the tetromino covering optimization problem.
+This repository compares sequential and OpenMP-based parallel strategies for a tetromino covering optimization problem.
 
-This repository contains three implementations of the same branch-and-bound solver:
+It contains three implementations of the same branch-and-bound solver:
 
 - a sequential baseline
 - an OpenMP task-parallel version
@@ -21,14 +21,14 @@ Constraints:
 - the difference between the number of T and Z pieces is at most 1
 - the solver searches for the minimum uncovered cost
 
-## Why this project is interesting
+## Scope
 
-This problem is computationally expensive because the search space grows very quickly. The project focuses on:
+The problem is computationally expensive because the search space grows rapidly. The project examines:
 
 - branch-and-bound pruning
 - feasibility checks for partial states
 - parallel exploration of independent subproblems
-- comparison between task-parallel and data-parallel approaches
+- differences between task-parallel and data-parallel execution models
 
 ## Repository structure
 
@@ -107,7 +107,7 @@ Each solver prints:
 
 ## Benchmark results
 
-The following benchmark results were measured on the included sample maps using the project benchmark runner.
+The following measurements were obtained on the included sample maps using the benchmark runner in this repository.
 
 | Map | Sequential (ms) | Task-parallel (ms) | Data-parallel (ms) | Best speedup |
 |---|---:|---:|---:|---:|
@@ -116,17 +116,17 @@ The following benchmark results were measured on the included sample maps using 
 | mapa7_7.txt | 12 | 33 | 9 | 1.33x |
 | mapa7_10.txt | 3460 | 1809 | 1565 | 2.21x |
 
-These results show that the parallel strategies can reduce runtime significantly on larger instances, while preserving the same optimal cost.
+The parallel versions reduce runtime on the larger inputs while producing the same optimal cost.
 
-> Raw benchmark output is also available in [MapsComparison/Results.txt](MapsComparison/Results.txt).
+> Raw benchmark output is available in [MapsComparison/Results.txt](MapsComparison/Results.txt).
 
 ## Project status
 
-This repository is primarily an academic and comparative parallel programming project. It is intended to demonstrate algorithmic design, pruning strategies, and parallel execution patterns rather than a production-ready software package.
+This repository is primarily an academic comparison of parallel programming strategies. It is intended to illustrate branch-and-bound search, pruning techniques, and the practical trade-offs of OpenMP-based parallelization rather than to provide a production-ready software package.
 
-## Future work
+## Potential extensions
 
-- add a proper MPI-based distributed implementation
+- add an MPI-based distributed implementation
 - unify shared solver logic into a common core
 - improve benchmarking and result reporting
 - add a cleaner CLI interface and configuration options
